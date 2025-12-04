@@ -1,0 +1,186 @@
+\documentclass[11pt, a4paper]{article}
+
+% --- PDFFLATEX COMPATIBILITY BLOCK ---
+% Sử dụng inputenc để xử lý các ký tự UTF-8
+\usepackage[utf8]{inputenc}
+% Sử dụng fontenc T1 cho mã hóa font tốt hơn
+\usepackage[T1]{fontenc}
+% Cấu hình ngôn ngữ cơ bản
+\usepackage[english]{babel}
+
+% --- Cấu hình Khung Hình Ảnh và Bố Cục ---
+\usepackage[a4paper, top=2.5cm, bottom=2.5cm, left=2cm, right=2cm]{geometry}
+\usepackage{graphicx} % Cần thiết để chèn hình ảnh
+
+% Required packages for the report
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{verbatim} % For code snippets
+\usepackage{hyperref} % Should be the last package loaded
+
+% --- Document Metadata ---
+\title{\vspace{-1.5cm}Practical Work 2: RPC-Based Master File Transfer System}
+\author{Tran Hai Dang}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This report details the migration and enhancement of a simple TCP file transfer system to a robust distributed architecture utilizing the Remote Procedure Call (RPC) mechanism via gRPC. The initial raw socket implementation was replaced by a client-streaming RPC service, designed to handle large files efficiently through a chunking mechanism. Key enhancements include mandatory secret-key authentication, a multi-threaded client enabling parallel file uploads, and an automatic retry mechanism with exponential backoff to ensure reliable transfer completion in the face of transient network errors.
+\end{abstract}
+
+\section{System Design and Organization}
+
+The system is constructed upon the Client-Server model, leveraging Google's gRPC framework, which uses Protocol Buffers (Protobuf) as its Interface Definition Language (IDL) and HTTP/2 for the transport layer. This choice provides high-performance, language-agnostic communication capabilities, superseding the manual serialization and error management required by raw TCP sockets.
+
+\subsection{RPC Service Design (Protocol Buffers)}
+
+The service contract is formally defined in the \texttt{file\_transfer.proto} file. This design aims to address the requirements for large file support, reliability, and security.
+
+\begin{figure}[htbp]
+  \centering
+  % CHÚ THÍCH: Vui lòng thay thế khối \framebox này bằng lệnh \includegraphics khi biên dịch.
+  \includegraphics[width=1.0\textwidth]{report.png}
+  \caption{\textit{The gRPC compilation process, showing how the IDL (Protocol Buffers) is transformed into client and server components for implementation.}}
+  \label{fig:rpc_compilation_flow}
+\end{figure}
+
+\textbf{Service and Procedure:}
+The primary service is \texttt{FileTransferService} with a single procedure, \texttt{UploadFile}.
+$$
+\text{rpc UploadFile (stream FileChunk) returns (TransferStatus);}
+$$
+This procedure is implemented as a \textbf{client-streaming} RPC. The Client transmits a stream of \texttt{FileChunk} messages, and the Server responds with a single \texttt{TransferStatus} message upon completion of the stream. This approach is considered optimal for efficient, chunked file transfer.
+
+\begin{itemize}
+    \item \texttt{FileChunk}: This message is repurposed for both metadata (in the initial chunk) and binary content. It includes fields for \texttt{filename}, \texttt{file\_size}, a unique \texttt{transfer\_id}, and the \texttt{secret\_key} for authentication.
+    \item \texttt{TransferStatus}: The Server's final response, containing a \texttt{StatusCode} (e.g., \texttt{SUCCESS}, \texttt{FAILURE}, \texttt{UNAUTHENTICATED}) and a descriptive message, echoing the \texttt{transfer\_id} for client tracking.
+\end{itemize}
+
+\subsection{System Organization}
+
+The system structure is organized into three layers to ensure clear separation of concerns: Definition, Compilation, and Implementation.
+
+\begin{enumerate}
+    \item \textbf{Definition Layer:} The \texttt{file\_transfer.proto} file (IDL) strictly defines the service contract.
+    \item \textbf{Compilation Layer:} The gRPC compiler automatically generates the language-specific client \textbf{Stub} and server \textbf{Skeleton} code, ensuring consistency in serialization and deserialization across the network.
+    \item \textbf{Implementation Layer:}
+    \begin{itemize}
+        \item \textbf{Server (\texttt{server.py}):} Implements the service logic, listens on port 50051, and utilizes a multi-threaded executor to handle multiple concurrent client streams, thereby supporting parallel uploads.
+        \item \textbf{Client (\texttt{client.py}):} Employs a multi-threaded architecture using a \texttt{Queue} and dedicated worker threads (\texttt{MAX\_WORKERS=5}) to process and upload files in parallel, significantly increasing throughput.
+    \end{itemize}
+\end{enumerate}
+
+\section{Implementation of Advanced Features}
+
+\subsection{File Transfer Mechanism (Chunking and Streaming)}
+
+The file transfer is achieved by converting the local file into an asynchronous stream of \texttt{FileChunk} messages via a Python generator function, \texttt{generate\_file\_chunks}.
+
+\begin{verbatim}
+def generate_file_chunks(transfer_id, file_path, secret_key):
+    # ... calculates file_size ...
+    
+    with open(file_path, "rb") as f:
+        # 1. Yield the first chunk including metadata and the authentication key
+        yield pb2.FileChunk(
+            transfer_id=transfer_id, filename=filename, file_size=file_size,
+            secret_key=secret_key, chunk_index=0, content=f.read(CHUNK_SIZE)
+        )
+        
+        # 2. Yield subsequent chunks containing only content
+        while True:
+            chunk = f.read(CHUNK_SIZE)
+            if not chunk: break
+            chunk_index += 1
+            yield pb2.FileChunk(
+                transfer_id=transfer_id, chunk_index=chunk_index, content=chunk
+            )
+\end{verbatim}
+
+\textbf{Server-Side Authentication and File Writing:}
+The Server processes the data stream. It first performs authentication using the \texttt{secret\_key} contained in the initial chunk before proceeding to write any data.
+
+\begin{verbatim}
+def UploadFile(self, request_iterator, context):
+    first_chunk = next(request_iterator)
+    
+    # Authentication Check
+    if first_chunk.secret_key != VALID_SECRET_KEY:
+        return pb2.TransferStatus(status=pb2.TransferStatus.UNAUTHENTICATED, message="Invalid secret key.", transfer_id=first_chunk.transfer_id)
+
+    # Open file using metadata from first_chunk
+    file_handle = open(file_path, "wb")
+    file_handle.write(first_chunk.content)
+    
+    # Process remaining chunks in the stream
+    for chunk in request_iterator:
+        file_handle.write(chunk.content)
+    
+    file_handle.close()
+    return pb2.TransferStatus(status=pb2.TransferStatus.SUCCESS, message="File received OK via RPC.", transfer_id=first_chunk.transfer_id)
+\end{verbatim}
+
+\subsection{Logging and Retry Mechanism Implementation}
+
+The client function \texttt{send\_file\_with\_retry} encapsulates the remote call within a loop to handle transient failures, thereby addressing the reliability requirement.
+
+\begin{verbatim}
+MAX_RETRIES = 3 # Maximum number of attempts
+...
+def send_file_with_retry(stub, file_path):
+    for attempt in range(MAX_RETRIES):
+        try:
+            # 1. RPC Call
+            chunk_generator = generate_file_chunks(transfer_id, file_path, SECRET_KEY)
+            response = stub.UploadFile(chunk_generator)
+
+            # 2. Handle SUCCESS and UNAUTHENTICATED (no retry)
+            if response.status == pb2.TransferStatus.SUCCESS: return True
+            if response.status == pb2.TransferStatus.UNAUTHENTICATED: return False
+            
+            # 3. Handle FAILURE (retry)
+            logging.warning(f"Transfer ID {transfer_id}: Failed: {response.message}. Retrying...")
+            time.sleep(2 * (attempt + 1)) # Exponential backoff (2s, 4s, 8s, ...)
+            continue
+
+        except grpc.RpcError as e:
+            # Handle connection errors (retry)
+            logging.error(f"Transfer ID {transfer_id}: RPC Error on attempt {attempt + 1}: {e.details()}")
+            time.sleep(2 * (attempt + 1))
+            continue
+            
+    # If all attempts fail
+    return False 
+\end{verbatim}
+
+\section{Component Responsibilities}
+
+This section outlines the specific roles and responsibilities of each component within the RPC process.
+
+\begin{itemize}
+    \item \textbf{gRPC Compiler (\texttt{protoc}):}
+    \begin{itemize}
+        \item Generates the \textbf{Client Stub} and \textbf{Server Skeleton} from the IDL.
+        \item Manages the low-level \textbf{data conversion} (serialization and deserialization) of \texttt{FileChunk} messages to ensure cross-language compatibility.
+    \end{itemize}
+
+    \item \textbf{Client (\texttt{client.py}):}
+    \begin{itemize}
+        \item Manages a concurrent \textbf{worker pool} and a \textbf{file queue} to enable parallel uploads.
+        \item Implements the \textbf{retry logic} and \textbf{exponential backoff}.
+        \item Creates the channel, generates the data stream, and attaches the authentication key.
+    \end{itemize}
+
+    \item \textbf{Server (\texttt{server.py}):}
+    \begin{itemize}
+        \item Hosts the service and runs a \textbf{thread pool} to handle simultaneous client connections.
+        \item Executes \textbf{authentication} on the first chunk received.
+        \item \textbf{Consumes the streaming request} and reconstructs the file on the local filesystem.
+        \item Returns the final \texttt{TransferStatus} to the client.
+    \end{itemize}
+\end{itemize}
+
+\end{document}
