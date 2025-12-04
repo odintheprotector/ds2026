@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+// Defines the service contract
+service FileTransferService {
+  // Client-streaming RPC method for chunked file upload.
+  // The first message in the stream will contain the metadata and key.
+  rpc UploadFile (stream FileChunk) returns (TransferStatus);
+}
+
+// Message used for transferring file data in chunks
+message FileChunk {
+  // --- Metadata (Sent in the first chunk) ---
+  // A unique identifier for the entire file transfer session (for retries/logging)
+  string transfer_id = 1;
+  string filename = 2;
+  int64 file_size = 3; 
+  // Authentication: Secret key provided by the client
+  string secret_key = 4; 
+
+  // --- Chunk Data (Sent in all chunks) ---
+  int32 chunk_index = 5; // Index of the chunk (0, 1, 2, ...)
+  bytes content = 6;
+}
+
+// Message used for the server's response
+message TransferStatus {
+  enum StatusCode {
+    SUCCESS = 0;
+    FAILURE = 1;
+    UNAUTHENTICATED = 2;
+  }
+  StatusCode status = 1;
+  string message = 2; 
+  string transfer_id = 3; // Echo back the ID for client tracking
+}
